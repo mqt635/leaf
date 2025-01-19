@@ -1,7 +1,7 @@
-pub mod tcp;
-pub mod udp;
+pub mod datagram;
+pub mod stream;
 
-pub use tcp::Handler as TcpHandler;
-pub use udp::Handler as UdpHandler;
+pub use datagram::Handler as DatagramHandler;
+pub use stream::Handler as StreamHandler;
 
 use super::shadow;

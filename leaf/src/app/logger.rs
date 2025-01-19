@@ -1,85 +1,120 @@
+use std::fs::OpenOptions;
+use std::path::Path;
+use std::sync::RwLock;
+
+use anyhow::Result;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{
+    filter::LevelFilter, fmt, layer::Layered, prelude::*, registry::Registry, reload,
+    reload::Handle,
+};
+
 use crate::config;
 
-use anyhow::{anyhow, Result};
+type FilterHandle = Handle<LevelFilter, Registry>;
 
-pub fn setup_logger(config: &config::Log) -> Result<()> {
-    let loglevel = match config.level {
-        config::Log_Level::TRACE => log::LevelFilter::Trace,
-        config::Log_Level::DEBUG => log::LevelFilter::Debug,
-        config::Log_Level::INFO => log::LevelFilter::Info,
-        config::Log_Level::WARN => log::LevelFilter::Warn,
-        config::Log_Level::ERROR => log::LevelFilter::Error,
-    };
+type WriterLayer = fmt::Layer<
+    Layered<reload::Layer<LevelFilter, Registry>, Registry>,
+    tracing_subscriber::fmt::format::DefaultFields,
+    tracing_subscriber::fmt::format::Format,
+    tracing_appender::non_blocking::NonBlocking,
+>;
+type WriterHandle = Handle<WriterLayer, Layered<reload::Layer<LevelFilter, Registry>, Registry>>;
 
-    let mut dispatch = fern::Dispatch::new()
-        .format(move |out, message, record| {
-            if *crate::option::LOG_NO_COLOR {
-                out.finish(format_args!(
-                    "[{date}][{level}] {message}",
-                    date = chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                    level = record.level(),
-                    message = message,
-                ))
-            } else {
-                use fern::colors::{Color, ColoredLevelConfig};
-                let colors_line = ColoredLevelConfig::new()
-                    .error(Color::Red)
-                    .warn(Color::Yellow)
-                    .info(Color::White)
-                    .debug(Color::White)
-                    .trace(Color::BrightBlack);
+struct HandleController {
+    filter: FilterHandle,
+    writer: WriterHandle,
+    writer_guard: WorkerGuard,
+}
 
-                let colors_level = colors_line.info(Color::Green);
-                out.finish(format_args!(
-                    // "{color_line}[{date}][{level}{color_line}][{target}] {message}\x1B[0m",
-                    "{color_line}[{date}][{level}{color_line}] {message}\x1B[0m",
-                    color_line = format_args!(
-                        "\x1B[{}m",
-                        colors_line.get_color(&record.level()).to_fg_str()
-                    ),
-                    date = chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                    // target = record.target(),
-                    level = colors_level.color(record.level()),
-                    message = message,
-                ))
+impl HandleController {
+    pub fn new(filter: FilterHandle, writer: WriterHandle, writer_guard: WorkerGuard) -> Self {
+        Self {
+            filter,
+            writer,
+            writer_guard,
+        }
+    }
+
+    pub fn reload(
+        &mut self,
+        filter: LevelFilter,
+        writer: WriterLayer,
+        writer_guard: WorkerGuard,
+    ) -> Result<(), reload::Error> {
+        self.filter.modify(|f| *f = filter)?;
+        self.writer.reload(writer)?;
+        self.writer_guard = writer_guard;
+        Ok(())
+    }
+}
+
+static HANDLE: RwLock<Option<HandleController>> = RwLock::new(None);
+
+fn get_writer(config: &config::Log) -> Result<(WriterLayer, WorkerGuard)> {
+    Ok(match config.output.unwrap() {
+        config::log::Output::CONSOLE => {
+            #[cfg(target_os = "macos")]
+            {
+                if *crate::option::LOG_CONSOLE_OUT {
+                    let writer = crate::mobile::logger::ConsoleWriter::default();
+                    let (writer, writer_guard) = tracing_appender::non_blocking(writer);
+                    let writer = fmt::Layer::default().with_ansi(false).with_writer(writer);
+                    (writer, writer_guard)
+                } else {
+                    let (writer, writer_guard) = tracing_appender::non_blocking(std::io::stdout());
+                    let writer = fmt::Layer::default().with_writer(writer);
+                    (writer, writer_guard)
+                }
             }
-        })
-        .level(log::LevelFilter::Warn)
-        .level_for("leaf", loglevel);
-
-    match config.output {
-        config::Log_Output::CONSOLE => {
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            {
+                let (writer, writer_guard) = tracing_appender::non_blocking(std::io::stdout());
+                let writer = fmt::Layer::default().with_writer(writer);
+                (writer, writer_guard)
+            }
             #[cfg(any(target_os = "ios", target_os = "android"))]
             {
-                let console_output = fern::Output::writer(
-                    Box::new(crate::mobile::logger::ConsoleWriter::default()),
-                    "\n",
-                );
-                dispatch = dispatch.chain(console_output);
-            }
-            #[cfg(not(any(target_os = "ios", target_os = "android")))]
-            {
-                dispatch = dispatch.chain(fern::Output::stdout("\n"));
-            }
-            #[cfg(target_os = "macos")]
-            if *crate::option::LOG_CONSOLE_OUT {
-                let console_output = fern::Output::writer(
-                    Box::new(crate::mobile::logger::ConsoleWriter::default()),
-                    "\n",
-                );
-                dispatch = dispatch.chain(console_output);
+                let writer = crate::mobile::logger::ConsoleWriter::default();
+                let (writer, writer_guard) = tracing_appender::non_blocking(writer);
+                let writer = fmt::Layer::default().with_ansi(false).with_writer(writer);
+                (writer, writer_guard)
             }
         }
-        config::Log_Output::FILE => {
-            let f = fern::log_file(&config.output_file)?;
-            let file_output = fern::Output::file(f, "\n");
-            dispatch = dispatch.chain(file_output);
+        config::log::Output::FILE => {
+            let p = Path::new(&config.output_file);
+            let writer = OpenOptions::new().append(true).create(true).open(p)?;
+            let (writer, writer_guard) = tracing_appender::non_blocking(writer);
+            let writer = fmt::Layer::default().with_ansi(false).with_writer(writer);
+            (writer, writer_guard)
         }
-    }
+    })
+}
 
-    if let Err(e) = dispatch.apply() {
-        return Err(anyhow!("apply logger config failed: {}", e));
+pub fn setup_logger(config: &config::Log) -> Result<()> {
+    let filter = match config.level.unwrap() {
+        config::log::Level::TRACE => LevelFilter::TRACE,
+        config::log::Level::DEBUG => LevelFilter::DEBUG,
+        config::log::Level::INFO => LevelFilter::INFO,
+        config::log::Level::WARN => LevelFilter::WARN,
+        config::log::Level::ERROR => LevelFilter::ERROR,
+    };
+    let (writer, writer_guard) = get_writer(config)?;
+    let mut h = HANDLE.write().unwrap();
+    if let Some(h) = h.as_mut() {
+        h.reload(filter, writer, writer_guard)?;
+    } else {
+        let (filter, filter_handle) = reload::Layer::new(filter);
+        let (writer, writer_handle) = reload::Layer::new(writer);
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(writer)
+            .init();
+        *h = Some(HandleController::new(
+            filter_handle,
+            writer_handle,
+            writer_guard,
+        ));
     }
-
     Ok(())
 }

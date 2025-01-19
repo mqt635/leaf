@@ -1,9 +1,6 @@
-syntax = "proto3";
+// Every time you make changes to this file, run `make proto-gen` to re-generate protobuf files.
 
-message Api {
-	string address = 1;
-	uint32 port = 2;
-}
+syntax = "proto3";
 
 message Dns {
 	message Ips {
@@ -45,13 +42,19 @@ message TunInboundSettings {
 	repeated string fake_dns_include = 8;
 }
 
+message CatInboundSettings {
+	string network = 1;
+	string address = 2;
+	uint32 port = 3;
+}
+
 message ShadowsocksInboundSettings {
 	string method = 1;
 	string password = 2;
 }
 
 message TrojanInboundSettings {
-	string password = 3;
+	repeated string passwords = 1;
 }
 
 message WebSocketInboundSettings {
@@ -65,6 +68,7 @@ message AMuxInboundSettings {
 message QuicInboundSettings {
 	string certificate = 1;
 	string certificate_key = 2;
+	repeated string alpn = 3;
 }
 
 message TlsInboundSettings {
@@ -92,6 +96,8 @@ message RedirectOutboundSettings {
 message SocksOutboundSettings {
 	string address = 1;
 	uint32 port = 2;
+	string username = 3;
+	string password = 4;
 }
 
 message ShadowsocksOutboundSettings {
@@ -99,6 +105,13 @@ message ShadowsocksOutboundSettings {
 	uint32 port = 2;
 	string method = 3; // TODO use enum
 	string password = 4;
+	optional string prefix = 5;
+}
+
+message ObfsOutboundSettings {
+	string method = 1; // TODO use enum
+	string host = 2;
+	string path = 3;
 }
 
 message TrojanOutboundSettings {
@@ -111,6 +124,7 @@ message TlsOutboundSettings {
 	string server_name = 1;
 	repeated string alpn = 2;
 	string certificate = 3;
+	bool insecure = 4;
 }
 
 message WebSocketOutboundSettings {
@@ -123,12 +137,9 @@ message TryAllOutboundSettings {
 	uint32 delay_base = 2;
 }
 
-message RandomOutboundSettings {
+message StaticOutboundSettings {
 	repeated string actors = 1;
-}
-
-message RROutboundSettings {
-	repeated string actors = 1;
+	string method = 2;
 }
 
 message AMuxOutboundSettings {
@@ -137,6 +148,8 @@ message AMuxOutboundSettings {
 	repeated string actors = 3;
 	uint32 max_accepts = 4;
 	uint32 concurrency = 5;
+	uint64 max_recv_bytes = 6;
+	uint64 max_lifetime = 7;
 }
 
 message QuicOutboundSettings {
@@ -144,28 +157,63 @@ message QuicOutboundSettings {
 	uint32 port = 2;
 	string server_name = 3;
 	string certificate = 4;
+	repeated string alpn = 5;
+}
+
+message VMessOutboundSettings {
+    string address = 1;
+    uint32 port = 2;
+    string uuid = 3;
+    string security = 4;
 }
 
 message ChainOutboundSettings {
 	repeated string actors = 1;
 }
 
-message RetryOutboundSettings {
-	repeated string actors = 1;
-	uint32 attempts = 2;
-}
-
 message FailOverOutboundSettings {
+  // A list of outbound tags.
 	repeated string actors = 1;
+  // The connect timeout value for the outbounds, in seconds. Some outbounds don't
+  // need to "connect", those outbounds have zero connect time. Default 4.
 	uint32 fail_timeout = 2;
-	// if health check is disabled, it will always perform failover
-	// to other actors dispite whatever failover option is set.
+  // Enable health check, to use other health check options, this must be true. Default
+  // true.
 	bool health_check = 3;
+  // Health check frequency, in seconds.
 	uint32 check_interval = 4;
+  // Use the next outbound if the current one failed, e.g. it's timeout. Default true.
 	bool failover = 5;
 	bool fallback_cache = 6;
 	uint32 cache_size = 7;
 	uint32 cache_timeout = 8;
+  // The outbound to be used when all actors are unavailable.
+	optional string last_resort = 9;
+  // Timeout for health check request, in seconds. Default is 6.
+	uint32 health_check_timeout = 10;
+  // Put a random delay from (0..health_check_delay] before each health check, in
+  // milliseconds. Default is 200.
+	uint32 health_check_delay = 11;
+  // Health check would stop running if no incoming requests in this period, it's
+  // considered the outbound is inactive, in seconds. Default is 900.
+	uint32 health_check_active = 12;
+  // Specify a list of preferred outbounds, these outbounds would have higher priority
+  // if they are in good health.
+	repeated string health_check_prefers = 13;
+  // Health check would run on start if this is true, by default health check would
+  // start to run when the first request comes in. Default is false.
+	bool health_check_on_start = 14;
+  // Hold incomming connections, wait for the initial health check to be done.
+  // Default false.
+	bool health_check_wait = 15;
+  // Total number of health check requests per outbound, the RTT to be used to sort
+  // the outbounds is the average of all successful attempts. Default 1.
+	uint32 health_check_attempts = 16;
+  // The percentage of successful health check requests which to consider an outbound
+  // is available, must be a value between [0, 100], if the result is lower than this
+  // percentage, the outbound's RTT would be set to a timeout value, thus marks the
+  // outbound as unavailable. Default 50.
+	uint32 health_check_success_percentage = 17;
 }
 
 message SelectOutboundSettings {
@@ -220,5 +268,4 @@ message Config {
 	repeated Outbound outbounds = 3;
 	Router router = 4;
 	Dns dns = 5;
-	Api api = 6;
 }

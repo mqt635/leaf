@@ -6,29 +6,24 @@ on:
       - v*
 
 jobs:
-  build-bin-cross:
+  build-cli-cross:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         target:
-          - mips-unknown-linux-musl
-            #          - mipsel-unknown-linux-musl
           - x86_64-unknown-linux-musl
-            #          - i686-unknown-linux-musl
           - aarch64-unknown-linux-musl
-            #          - arm-unknown-linux-musleabi
-            #          - armv7-unknown-linux-musleabihf
           - x86_64-pc-windows-gnu
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: true
 
       - name: install rust toolchain
         uses: hecrj/setup-rust-action@v1
         with:
-          rust-version: nightly
+          rust-version: stable
 
       - name: install deps
         run: |
@@ -42,8 +37,7 @@ jobs:
         run: |
           export CFG_COMMIT_HASH=`git log --pretty=format:'%h' -n 1`
           export CFG_COMMIT_DATE=`git log --format="%ci" -n 1`
-          export RUSTFLAGS="-Z strip=symbols"
-          ./misc/build_cross.sh ${{ matrix.target }}
+          cross build --release --target ${{ matrix.target }}
 
       - name: rename and compress artifacts
         if: ${{ matrix.target == 'x86_64-pc-windows-gnu' }}
@@ -57,102 +51,146 @@ jobs:
 
       - name: upload assets
         if: ${{ matrix.target == 'x86_64-pc-windows-gnu' }}
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: leaf-${{ matrix.target }}.exe
           path: leaf-${{ matrix.target }}.exe
 
       - name: upload assets
         if: ${{ matrix.target != 'x86_64-pc-windows-gnu' }}
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: leaf-${{ matrix.target }}
           path: leaf-${{ matrix.target }}
 
-  build-bin-local:
+  build-cli-macos:
+    runs-on: [macos-latest]
     strategy:
+      fail-fast: false
       matrix:
-        os: [macos-latest]
-        include:
-          - os: macos-latest
-            target: x86_64-apple-darwin
-    runs-on: ${{ matrix.os }}
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: true
 
       - name: install rust toolchain
         uses: hecrj/setup-rust-action@v1
         with:
-          rust-version: nightly
+          rust-version: stable
 
       - name: install llvm
         if: ${{ matrix.os == 'macos-latest' }}
         run: |
-          brew update && brew install llvm protobuf
+          brew install llvm protobuf
+
+      - name: install target
+        run: |
+          rustup target add ${{ matrix.target }}
 
       - name: build
         run: |
           export CFG_COMMIT_HASH=`git log --pretty=format:'%h' -n 1`
           export CFG_COMMIT_DATE=`git log --format="%ci" -n 1`
-          export RUSTFLAGS="-Z strip=symbols"
-          cargo build --release --target ${{ matrix.target }} -p leaf-bin
+          cargo build --release --target ${{ matrix.target }} -p leaf-cli
 
       - name: rename and compress artifacts
         run: |
           mv target/${{ matrix.target }}/release/leaf leaf-${{ matrix.target }}
 
       - name: upload assets
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: leaf-${{ matrix.target }}
           path: leaf-${{ matrix.target }}
 
-          #  build-lib-ios:
-          #    runs-on: macos-latest
-          #    steps:
-          #      - name: checkout
-          #        uses: actions/checkout@v2
-          #        with:
-          #          submodules: true
-          #
-          #      - name: install rust
-          #        uses: hecrj/setup-rust-action@v1
-          #        with:
-          #          rust-version: nightly
-          #
-          #      - name: install toolchain
-          #        run: |
-          #          rustup target add aarch64-apple-ios
-          #          cargo install cargo-lipo
-          #          cargo install cbindgen
-          #          brew update && brew install llvm unzip protobuf
-          #
-          #      - name: build
-          #        run: |
-          #          export RUSTFLAGS="-Z strip=symbols"
-          #          make ios
-          #
-          #      - name: zip artifacts
-          #        run: |
-          #          mv target/universal/release/libleaf.a .
-          #          mv target/universal/release/leaf.h .
-          #          zip libleaf-ios.zip leaf.h libleaf.a
-          #
-          #      - name: upload assets
-          #        uses: actions/upload-artifact@v2
-          #        with:
-          #          name: libleaf-ios.zip
-          #          path: libleaf-ios.zip
-
-  create-release:
-    needs: [build-bin-cross, build-bin-local, build-lib-ios]
+  build-lib-apple:
     runs-on: macos-latest
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: install rust
+        uses: hecrj/setup-rust-action@v1
+        with:
+          rust-version: stable
+
+      - name: install toolchain
+        run: |
+          cargo install cbindgen
+          brew install llvm unzip protobuf
+
+      - name: build
+        run: |
+          ./scripts/build_apple_xcframework.sh
+
+      - name: zip artifacts
+        run: |
+          mv target/apple/release/leaf.xcframework .
+          zip -r leaf.xcframework.zip leaf.xcframework
+
+      - name: upload assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: leaf.xcframework.zip
+          path: leaf.xcframework.zip
+
+  build-lib-android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: install rust
+        uses: hecrj/setup-rust-action@v1
+        with:
+          rust-version: stable
+
+      - name: install toolchain
+        run: |
+          cargo install cbindgen
+          apt update && apt install -y make llvm-dev libclang-dev clang pkg-config unzip curl default-jdk build-essential
+          export ANDROID_HOME=/tmp/Android/sdk
+          export NDK_HOME=/tmp/Android/sdk/ndk/25.2.9519653
+          export PATH=$ANDROID_HOME/cmdline-tools/bin:$PATH
+          cd /tmp/
+          curl -OL https://dl.google.com/android/repository/commandlinetools-linux-6858069_latest.zip
+          unzip commandlinetools-linux-6858069_latest.zip
+          mkdir -p $ANDROID_HOME
+          mv cmdline-tools $ANDROID_HOME
+          yes | sdkmanager --sdk_root=$ANDROID_HOME --licenses
+          sdkmanager --sdk_root=$ANDROID_HOME "ndk;25.2.9519653" "platforms;android-21"
+
+      - name: build
+        run: |
+          export ANDROID_HOME=/tmp/Android/sdk
+          export NDK_HOME=/tmp/Android/sdk/ndk/25.2.9519653
+          ./scripts/build_android.sh
+
+      - name: zip artifacts
+        run: |
+          mv target/leaf-android-libs .
+          zip -r leaf-android-libs.zip leaf-android-libs
+
+      - name: upload assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: leaf-android-libs.zip
+          path: leaf-android-libs.zip
+
+  create-release:
+    needs: [build-cli-cross, build-cli-macos, build-lib-apple, build-lib-android]
+    runs-on: macos-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
         with:
           submodules: true
 
@@ -172,29 +210,25 @@ jobs:
           echo -n "${{ steps.create_release.outputs.upload_url }}" > upload_url.txt
 
       - name: persist upload url
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: upload_url.txt
           path: ./upload_url.txt
 
-  release-bin:
+  release-cli:
     needs: [create-release]
     runs-on: macos-latest
     strategy:
       matrix:
         target:
           - x86_64-apple-darwin
-          - mips-unknown-linux-musl
-            #          - mipsel-unknown-linux-musl
+          - aarch64-apple-darwin
           - x86_64-unknown-linux-musl
-            #          - i686-unknown-linux-musl
           - aarch64-unknown-linux-musl
-            #          - arm-unknown-linux-musleabi
-            #          - armv7-unknown-linux-musleabihf
           - x86_64-pc-windows-gnu
     steps:
       - name: download upload url
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
           name: upload_url.txt
 
@@ -205,13 +239,13 @@ jobs:
 
       - name: download asset
         if: ${{ matrix.target != 'x86_64-pc-windows-gnu' }}
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
           name: leaf-${{ matrix.target }}
 
       - name: download asset
         if: ${{ matrix.target == 'x86_64-pc-windows-gnu' }}
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
           name: leaf-${{ matrix.target }}.exe
 
@@ -247,35 +281,46 @@ jobs:
           asset_name: leaf-${{ matrix.target }}.zip
           asset_content_type: application/octet-stream
 
-          #   release-lib:
-          #     needs: [create-release]
-          #     runs-on: macos-latest
-          #     steps:
-          #       - name: download upload url
-          #         uses: actions/download-artifact@v2
-          #         with:
-          #           name: upload_url.txt
-          # 
-          #       - name: get upload url
-          #         run: |
-          #           upload_url=`cat upload_url.txt`
-          #           echo "uploadurl=$upload_url" >> $GITHUB_ENV
-          # 
-          #       - name: install deps
-          #         run: |
-          #           brew update && brew install unzip
-          # 
-          #       - name: download asset
-          #         uses: actions/download-artifact@v2
-          #         with:
-          #           name: libleaf-ios.zip
-          # 
-          #       - name: upload asset
-          #         uses: actions/upload-release-asset@v1
-          #         env:
-          #           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          #         with:
-          #           upload_url: ${{ env.uploadurl }}
-          #           asset_path: ./libleaf-ios.zip
-          #           asset_name: libleaf-ios.zip
-          #           asset_content_type: application/octet-stream
+  release-mobile-libs:
+    needs: [create-release]
+    runs-on: macos-latest
+    steps:
+      - name: download upload url
+        uses: actions/download-artifact@v4
+        with:
+          name: upload_url.txt
+
+      - name: get upload url
+        run: |
+          upload_url=`cat upload_url.txt`
+          echo "uploadurl=$upload_url" >> $GITHUB_ENV
+
+      - name: download asset
+        uses: actions/download-artifact@v4
+        with:
+          name: leaf.xcframework.zip
+
+      - name: download asset
+        uses: actions/download-artifact@v4
+        with:
+          name: leaf-android-libs.zip
+
+      - name: upload asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ env.uploadurl }}
+          asset_path: ./leaf.xcframework.zip
+          asset_name: leaf.xcframework.zip
+          asset_content_type: application/octet-stream
+
+      - name: upload asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ env.uploadurl }}
+          asset_path: ./leaf-android-libs.zip
+          asset_name: leaf-android-libs.zip
+          asset_content_type: application/octet-stream

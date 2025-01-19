@@ -52,6 +52,7 @@ fn to_errno(e: leaf::Error) -> i32 {
 ///                   multi_thread is true.
 /// @return ERR_OK on finish running, any other errors means a startup failure.
 #[no_mangle]
+#[allow(unused_variables)]
 pub extern "C" fn leaf_run_with_options(
     rt_id: u16,
     config_path: *const c_char,
@@ -106,6 +107,24 @@ pub extern "C" fn leaf_run(rt_id: u16, config_path: *const c_char) -> i32 {
     }
 }
 
+#[no_mangle]
+pub extern "C" fn leaf_run_with_config_string(rt_id: u16, config: *const c_char) -> i32 {
+    if let Ok(config) = unsafe { CStr::from_ptr(config).to_str() } {
+        let opts = leaf::StartOptions {
+            config: leaf::Config::Str(config.to_string()),
+            #[cfg(feature = "auto-reload")]
+            auto_reload: false,
+            runtime_opt: leaf::RuntimeOption::SingleThread,
+        };
+        if let Err(e) = leaf::start(rt_id, opts) {
+            return to_errno(e);
+        }
+        ERR_OK
+    } else {
+        ERR_CONFIG_PATH
+    }
+}
+
 /// Reloads DNS servers, outbounds and routing rules from the config file.
 ///
 /// @param rt_id The ID of the leaf instance to reload.
@@ -137,7 +156,7 @@ pub extern "C" fn leaf_shutdown(rt_id: u16) -> bool {
 #[no_mangle]
 pub extern "C" fn leaf_test_config(config_path: *const c_char) -> i32 {
     if let Ok(config_path) = unsafe { CStr::from_ptr(config_path).to_str() } {
-        if let Err(e) = leaf::test_config(&config_path) {
+        if let Err(e) = leaf::test_config(config_path) {
             return to_errno(e);
         }
         ERR_OK

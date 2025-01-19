@@ -1,6 +1,6 @@
 mod common;
 
-// app(socks) -> (socks)client(ws+trojan) -> (ws+trojan)server(direct) -> echo
+// app(socks) -> (socks)client(chain(ws+trojan)) -> (chain(ws+trojan))server(direct) -> echo
 #[cfg(all(
     feature = "outbound-socks",
     feature = "inbound-socks",
@@ -16,6 +16,9 @@ mod common;
 fn test_ws_trojan() {
     let config1 = r#"
     {
+        "log": {
+            "level": "trace"
+        },
         "inbounds": [
             {
                 "protocol": "socks",
@@ -55,6 +58,9 @@ fn test_ws_trojan() {
 
     let config2 = r#"
     {
+        "log": {
+            "level": "trace"
+        },
         "inbounds": [
             {
                 "protocol": "chain",
@@ -78,7 +84,9 @@ fn test_ws_trojan() {
                 "protocol": "trojan",
                 "tag": "trojan",
                 "settings": {
-                    "password": "password"
+                    "passwords": [
+                        "password"
+                    ]
                 }
             }
         ],

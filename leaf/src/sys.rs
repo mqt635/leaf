@@ -1,6 +1,7 @@
 use super::common;
 use super::option;
 
+#[derive(Default)]
 pub struct NetInfo {
     pub default_ipv4_gateway: Option<String>,
     pub default_ipv6_gateway: Option<String>,
@@ -9,20 +10,6 @@ pub struct NetInfo {
     pub ipv4_forwarding: bool,
     pub ipv6_forwarding: bool,
     pub default_interface: Option<String>,
-}
-
-impl Default for NetInfo {
-    fn default() -> Self {
-        Self {
-            default_ipv4_gateway: None,
-            default_ipv6_gateway: None,
-            default_ipv4_address: None,
-            default_ipv6_address: None,
-            ipv4_forwarding: false,
-            ipv6_forwarding: false,
-            default_interface: None,
-        }
-    }
 }
 
 pub fn get_net_info() -> NetInfo {
@@ -81,6 +68,7 @@ pub fn get_net_info() -> NetInfo {
 }
 
 pub fn post_tun_creation_setup(net_info: &NetInfo) {
+    #[allow(unused_variables)]
     if let NetInfo {
         default_ipv4_gateway: Some(ipv4_gw),
         default_ipv6_gateway: ipv6_gw,
@@ -93,7 +81,7 @@ pub fn post_tun_creation_setup(net_info: &NetInfo) {
     {
         use std::net::{Ipv4Addr, Ipv6Addr};
         common::cmd::add_interface_ipv4_address(
-            &*option::DEFAULT_TUN_NAME,
+            &option::DEFAULT_TUN_NAME,
             (*option::DEFAULT_TUN_IPV4_ADDR)
                 .parse::<Ipv4Addr>()
                 .unwrap(),
@@ -131,7 +119,7 @@ pub fn post_tun_creation_setup(net_info: &NetInfo) {
 
         if *option::ENABLE_IPV6 {
             common::cmd::add_interface_ipv6_address(
-                &*option::DEFAULT_TUN_NAME,
+                &option::DEFAULT_TUN_NAME,
                 option::DEFAULT_TUN_IPV6_ADDR.parse::<Ipv6Addr>().unwrap(),
                 *option::DEFAULT_TUN_IPV6_PREFIXLEN,
             )
@@ -168,13 +156,14 @@ pub fn post_tun_creation_setup(net_info: &NetInfo) {
         #[cfg(target_os = "linux")]
         {
             if *option::GATEWAY_MODE {
-                common::cmd::add_iptable_forward(&*option::DEFAULT_TUN_NAME).unwrap();
+                common::cmd::add_iptable_forward(&option::DEFAULT_TUN_NAME).unwrap();
             }
         }
     }
 }
 
 pub fn post_tun_completion_setup(net_info: &NetInfo) {
+    #[allow(unused_variables)]
     if let NetInfo {
         default_ipv4_gateway: Some(ipv4_gw),
         default_ipv6_gateway: ipv6_gw,
@@ -234,7 +223,7 @@ pub fn post_tun_completion_setup(net_info: &NetInfo) {
         #[cfg(target_os = "linux")]
         {
             if *option::GATEWAY_MODE {
-                common::cmd::delete_iptable_forward(&*option::DEFAULT_TUN_NAME).unwrap();
+                common::cmd::delete_iptable_forward(&option::DEFAULT_TUN_NAME).unwrap();
             }
         }
     }

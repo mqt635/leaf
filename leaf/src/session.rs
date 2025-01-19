@@ -5,9 +5,7 @@ use std::{
     string::ToString,
 };
 
-use byteorder::{BigEndian, ByteOrder};
 use bytes::BufMut;
-use log::*;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
@@ -60,8 +58,15 @@ pub struct Session {
     pub destination: SocksAddr,
     /// The tag of the inbound handler this session initiated.
     pub inbound_tag: String,
+    /// The tag of the first outbound handler this session goes.
+    pub outbound_tag: String,
     /// Optional stream ID for multiplexing transports.
     pub stream_id: Option<StreamId>,
+    /// Optional source address which is forwarded via HTTP reverse proxy.
+    pub forwarded_source: Option<IpAddr>,
+    /// Instructs a multiplexed transport should creates a new underlying
+    /// connection for this session, and it will be used only once.
+    pub new_conn_once: bool,
 }
 
 impl Clone for Session {
@@ -72,7 +77,10 @@ impl Clone for Session {
             local_addr: self.local_addr,
             destination: self.destination.clone(),
             inbound_tag: self.inbound_tag.clone(),
+            outbound_tag: self.outbound_tag.clone(),
             stream_id: self.stream_id,
+            forwarded_source: self.forwarded_source,
+            new_conn_once: self.new_conn_once,
         }
     }
 }
@@ -85,7 +93,10 @@ impl Default for Session {
             local_addr: *crate::option::UNSPECIFIED_BIND_ADDR,
             destination: SocksAddr::any(),
             inbound_tag: "".to_string(),
+            outbound_tag: "".to_string(),
             stream_id: None,
+            forwarded_source: None,
+            new_conn_once: false,
         }
     }
 }
@@ -142,12 +153,11 @@ impl SocksAddr {
         Self::Ip("[::]:0".parse().unwrap())
     }
 
-    pub fn must_ip(self) -> SocketAddr {
+    pub fn must_ip(&self) -> &SocketAddr {
         match self {
-            SocksAddr::Ip(a) => a,
+            SocksAddr::Ip(ref a) => a,
             _ => {
-                error!("assert SocksAddr as SocketAddr failed");
-                panic!("");
+                panic!("assert SocksAddr as SocketAddr failed");
             }
         }
     }
@@ -203,11 +213,7 @@ impl SocksAddr {
     }
 
     /// Writes `self` into `buf`.
-    pub fn write_buf<T: BufMut>(
-        &self,
-        buf: &mut T,
-        addr_type: SocksAddrWireType,
-    ) -> io::Result<()> {
+    pub fn write_buf<T: BufMut>(&self, buf: &mut T, addr_type: SocksAddrWireType) {
         match self {
             Self::Ip(addr) => match addr {
                 SocketAddr::V4(addr) => match addr_type {
@@ -250,7 +256,6 @@ impl SocksAddr {
                 }
             },
         }
-        Ok(())
     }
 
     pub async fn read_from<T: AsyncRead + Unpin>(
@@ -413,10 +418,10 @@ impl TryFrom<(&[u8], SocksAddrWireType)> for SocksAddr {
                         return Err(insuff_bytes());
                     }
                     let mut ip_bytes = [0u8; 4];
-                    (&mut ip_bytes).copy_from_slice(&buf[1..5]);
+                    ip_bytes.copy_from_slice(&buf[1..5]);
                     let ip = Ipv4Addr::from(ip_bytes);
                     let mut port_bytes = [0u8; 2];
-                    (&mut port_bytes).copy_from_slice(&buf[5..7]);
+                    port_bytes.copy_from_slice(&buf[5..7]);
                     let port = u16::from_be_bytes(port_bytes);
                     Ok(Self::Ip((ip, port).into()))
                 }
@@ -425,10 +430,10 @@ impl TryFrom<(&[u8], SocksAddrWireType)> for SocksAddr {
                         return Err(insuff_bytes());
                     }
                     let mut ip_bytes = [0u8; 16];
-                    (&mut ip_bytes).copy_from_slice(&buf[1..17]);
+                    ip_bytes.copy_from_slice(&buf[1..17]);
                     let ip = Ipv6Addr::from(ip_bytes);
                     let mut port_bytes = [0u8; 2];
-                    (&mut port_bytes).copy_from_slice(&buf[17..19]);
+                    port_bytes.copy_from_slice(&buf[17..19]);
                     let port = u16::from_be_bytes(port_bytes);
                     Ok(Self::Ip((ip, port).into()))
                 }
@@ -441,11 +446,11 @@ impl TryFrom<(&[u8], SocksAddrWireType)> for SocksAddr {
                         return Err(insuff_bytes());
                     }
                     let domain =
-                        String::from_utf8((&buf[2..domain_len + 2]).to_vec()).map_err(|e| {
+                        String::from_utf8(buf[2..domain_len + 2].to_vec()).map_err(|e| {
                             io::Error::new(io::ErrorKind::Other, format!("invalid domain: {}", e))
                         })?;
                     let mut port_bytes = [0u8; 2];
-                    (&mut port_bytes).copy_from_slice(&buf[domain_len + 2..domain_len + 4]);
+                    port_bytes.copy_from_slice(&buf[domain_len + 2..domain_len + 4]);
                     let port = u16::from_be_bytes(port_bytes);
                     Ok(Self::Domain(domain, port))
                 }
@@ -457,10 +462,10 @@ impl TryFrom<(&[u8], SocksAddrWireType)> for SocksAddr {
                     if buf.len() < 4 + 2 {
                         return Err(insuff_bytes());
                     }
-                    let port = BigEndian::read_u16(&buf[..2]);
+                    let port = u16::from_be_bytes(buf[..2].try_into().unwrap());
                     let buf = &buf[2..];
                     let mut ip_bytes = [0u8; 4];
-                    (&mut ip_bytes).copy_from_slice(&buf[..4]);
+                    ip_bytes.copy_from_slice(&buf[..4]);
                     let ip = Ipv4Addr::from(ip_bytes);
                     Ok(Self::Ip((ip, port).into()))
                 }
@@ -469,10 +474,10 @@ impl TryFrom<(&[u8], SocksAddrWireType)> for SocksAddr {
                     if buf.len() < 16 + 2 {
                         return Err(insuff_bytes());
                     }
-                    let port = BigEndian::read_u16(&buf[..2]);
+                    let port = u16::from_be_bytes(buf[..2].try_into().unwrap());
                     let buf = &buf[2..];
                     let mut ip_bytes = [0u8; 16];
-                    (&mut ip_bytes).copy_from_slice(&buf[..16]);
+                    ip_bytes.copy_from_slice(&buf[..16]);
                     let ip = Ipv6Addr::from(ip_bytes);
                     Ok(Self::Ip((ip, port).into()))
                 }
@@ -481,14 +486,14 @@ impl TryFrom<(&[u8], SocksAddrWireType)> for SocksAddr {
                     if buf.len() < 3 {
                         return Err(insuff_bytes());
                     }
-                    let port = BigEndian::read_u16(&buf[..2]);
+                    let port = u16::from_be_bytes(buf[..2].try_into().unwrap());
                     let buf = &buf[2..];
                     let domain_len = buf[0] as usize;
                     let buf = &buf[1..];
                     if buf.len() < domain_len {
                         return Err(insuff_bytes());
                     }
-                    let domain = String::from_utf8((&buf[..domain_len]).to_vec()).map_err(|e| {
+                    let domain = String::from_utf8(buf[..domain_len].to_vec()).map_err(|e| {
                         io::Error::new(io::ErrorKind::Other, format!("invalid domain: {}", e))
                     })?;
                     Ok(Self::Domain(domain, port))

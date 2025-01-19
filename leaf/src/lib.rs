@@ -3,13 +3,13 @@ use std::io;
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::Once;
 
 use anyhow::anyhow;
 use lazy_static::lazy_static;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
+use tracing::{error, info, trace, warn};
 
 #[cfg(feature = "auto-reload")]
 use notify::{
@@ -20,6 +20,9 @@ use app::{
     dispatcher::Dispatcher, dns_client::DnsClient, inbound::manager::InboundManager,
     nat_manager::NatManager, outbound::manager::OutboundManager, router::Router,
 };
+
+#[cfg(feature = "stat")]
+use crate::app::{stat_manager::StatManager, SyncStatManager};
 
 #[cfg(feature = "api")]
 use crate::app::api::api_server::ApiServer;
@@ -72,6 +75,8 @@ pub struct RuntimeManager {
     router: Arc<RwLock<Router>>,
     dns_client: Arc<RwLock<DnsClient>>,
     outbound_manager: Arc<RwLock<OutboundManager>>,
+    #[cfg(feature = "stat")]
+    stat_manager: SyncStatManager,
     #[cfg(feature = "auto-reload")]
     watcher: Mutex<Option<RecommendedWatcher>>,
 }
@@ -87,6 +92,7 @@ impl RuntimeManager {
         router: Arc<RwLock<Router>>,
         dns_client: Arc<RwLock<DnsClient>>,
         outbound_manager: Arc<RwLock<OutboundManager>>,
+        #[cfg(feature = "stat")] stat_manager: SyncStatManager,
     ) -> Arc<Self> {
         Arc::new(Self {
             #[cfg(feature = "auto-reload")]
@@ -99,11 +105,19 @@ impl RuntimeManager {
             router,
             dns_client,
             outbound_manager,
+            #[cfg(feature = "stat")]
+            stat_manager,
             #[cfg(feature = "auto-reload")]
             watcher: Mutex::new(None),
         })
     }
 
+    #[cfg(feature = "stat")]
+    pub fn stat_manager(&self) -> SyncStatManager {
+        self.stat_manager.clone()
+    }
+
+    #[cfg(feature = "outbound-select")]
     pub async fn set_outbound_selected(&self, outbound: &str, select: &str) -> Result<(), Error> {
         if let Some(selector) = self.outbound_manager.read().await.get_selector(outbound) {
             selector
@@ -116,11 +130,18 @@ impl RuntimeManager {
         }
     }
 
+    #[cfg(feature = "outbound-select")]
     pub async fn get_outbound_selected(&self, outbound: &str) -> Result<String, Error> {
         if let Some(selector) = self.outbound_manager.read().await.get_selector(outbound) {
-            if let Some(tag) = selector.read().await.get_selected_tag() {
-                return Ok(tag);
-            }
+            return Ok(selector.read().await.get_selected_tag());
+        }
+        Err(Error::Config(anyhow!("not found")))
+    }
+
+    #[cfg(feature = "outbound-select")]
+    pub async fn get_outbound_selects(&self, outbound: &str) -> Result<Vec<String>, Error> {
+        if let Some(selector) = self.outbound_manager.read().await.get_selector(outbound) {
+            return Ok(selector.read().await.get_available_tags());
         }
         Err(Error::Config(anyhow!("not found")))
     }
@@ -135,8 +156,9 @@ impl RuntimeManager {
         } else {
             return Err(Error::NoConfigFile);
         };
-        log::info!("reloading from config file: {}", config_path);
+        info!("reloading from config file: {}", config_path);
         let mut config = config::from_file(config_path).map_err(Error::Config)?;
+        app::logger::setup_logger(&config.log)?;
         self.router.write().await.reload(&mut config.router)?;
         self.dns_client.write().await.reload(&config.dns)?;
         self.outbound_manager
@@ -144,7 +166,7 @@ impl RuntimeManager {
             .await
             .reload(&config.outbounds, self.dns_client.clone())
             .await?;
-        log::info!("reloaded from config file: {}", config_path);
+        info!("reloaded from config file: {}", config_path);
         Ok(())
     }
 
@@ -163,7 +185,7 @@ impl RuntimeManager {
     pub async fn shutdown(&self) -> bool {
         let tx = self.shutdown_tx.clone();
         if let Err(e) = tx.send(()).await {
-            log::warn!("sending shutdown signal failed: {}", e);
+            warn!("sending shutdown signal failed: {}", e);
             return false;
         }
         true
@@ -172,7 +194,7 @@ impl RuntimeManager {
     pub fn blocking_shutdown(&self) -> bool {
         let tx = self.shutdown_tx.clone();
         if let Err(e) = tx.blocking_send(()) {
-            log::warn!("sending shutdown signal failed: {}", e);
+            warn!("sending shutdown signal failed: {}", e);
             return false;
         }
         true
@@ -186,7 +208,7 @@ impl RuntimeManager {
             return Err(Error::NoConfigFile);
         };
         if self.auto_reload {
-            log::trace!("starting new watcher for config file: {}", config_path);
+            trace!("starting new watcher for config file: {}", config_path);
             let rt_id = self.rt_id;
             let mut watcher: RecommendedWatcher =
                 notify::recommended_watcher(move |res: NotifyResult<event::Event>| {
@@ -199,9 +221,9 @@ impl RuntimeManager {
                                 event::EventKind::Modify(event::ModifyKind::Data(
                                     event::DataChange::Content,
                                 )) => {
-                                    log::info!("config file event matched: {:?}", ev);
+                                    info!("config file event matched: {:?}", ev);
                                     if let Err(e) = reload(rt_id) {
-                                        log::warn!("reload config file failed: {}", e);
+                                        warn!("reload config file failed: {}", e);
                                     }
                                 }
                                 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -209,37 +231,35 @@ impl RuntimeManager {
                                     event::AccessMode::Write,
                                 ))
                                 | event::EventKind::Remove(event::RemoveKind::File) => {
-                                    log::info!("config file event matched: {:?}", ev);
+                                    info!("config file event matched: {:?}", ev);
                                     if let Err(e) = reload(rt_id) {
-                                        log::warn!("reload config file failed: {}", e);
+                                        warn!("reload config file failed: {}", e);
                                     }
                                 }
                                 #[cfg(target_os = "windows")]
                                 event::EventKind::Modify(event::ModifyKind::Data(
                                     event::DataChange::Any,
                                 )) => {
-                                    log::info!("config file event matched: {:?}", ev);
+                                    info!("config file event matched: {:?}", ev);
                                     if let Err(e) = reload(rt_id) {
-                                        log::warn!("reload config file failed: {}", e);
+                                        warn!("reload config file failed: {}", e);
                                     }
                                 }
                                 _ => {
-                                    log::trace!("skip config file event: {:?}", ev);
+                                    trace!("skip config file event: {:?}", ev);
                                 }
                             }
                             // The config file could somehow be removed and re-created
                             // by an editor, in that case create a new watcher to watch
                             // the new file.
                             if let event::EventKind::Remove(event::RemoveKind::File) = ev.kind {
-                                if let Ok(g) = RUNTIME_MANAGER.lock() {
-                                    if let Some(m) = g.get(&rt_id) {
-                                        let _ = m.new_watcher();
-                                    }
+                                if let Some(m) = RUNTIME_MANAGER.lock().unwrap().get(&rt_id) {
+                                    let _ = m.new_watcher();
                                 }
                             }
                         }
                         Err(e) => {
-                            log::error!("config file watch error: {:?}", e);
+                            error!("config file watch error: {:?}", e);
                         }
                     }
                 })
@@ -250,7 +270,7 @@ impl RuntimeManager {
                     RecursiveMode::NonRecursive,
                 )
                 .map_err(Error::Watcher)?;
-            log::info!("watching changes of file: {}", config_path);
+            info!("watching changes of file: {}", config_path);
             self.watcher.lock().unwrap().replace(watcher);
         }
         Ok(())
@@ -265,19 +285,19 @@ lazy_static! {
 }
 
 pub fn reload(key: RuntimeId) -> Result<(), Error> {
-    if let Ok(g) = RUNTIME_MANAGER.lock() {
-        if let Some(m) = g.get(&key) {
-            return m.blocking_reload();
-        }
+    if let Some(m) = RUNTIME_MANAGER
+        .lock()
+        .map_err(|_| Error::RuntimeManager)?
+        .get(&key)
+    {
+        return m.blocking_reload();
     }
     Err(Error::RuntimeManager)
 }
 
 pub fn shutdown(key: RuntimeId) -> bool {
-    if let Ok(g) = RUNTIME_MANAGER.lock() {
-        if let Some(m) = g.get(&key) {
-            return m.blocking_shutdown();
-        }
+    if let Some(m) = RUNTIME_MANAGER.lock().unwrap().get(&key) {
+        return m.blocking_shutdown();
     }
     false
 }
@@ -343,6 +363,7 @@ pub struct StartOptions {
 }
 
 pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
+    #[cfg(debug_assertions)]
     println!("start with options:\n{:#?}", opts);
 
     let (reload_tx, mut reload_rx) = mpsc::channel(1);
@@ -359,16 +380,7 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
         Config::Internal(c) => c,
     };
 
-    // FIXME Unfortunately fern does not allow re-initializing the logger,
-    // should consider another logging lib if the situation doesn't change.
-    let log = config
-        .log
-        .as_ref()
-        .ok_or_else(|| Error::Config(anyhow!("empty log setting")))?;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(move || {
-        app::logger::setup_logger(log).expect("setup logger failed");
-    });
+    app::logger::setup_logger(&config.log)?;
 
     let rt = new_runtime(&opts.runtime_opt)?;
     let _g = rt.enter();
@@ -386,11 +398,27 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
         &mut config.router,
         dns_client.clone(),
     )));
+    #[cfg(feature = "stat")]
+    let stat_manager = Arc::new(RwLock::new(StatManager::new()));
+    #[cfg(feature = "stat")]
+    runners.push(StatManager::cleanup_task(stat_manager.clone()));
     let dispatcher = Arc::new(Dispatcher::new(
         outbound_manager.clone(),
         router.clone(),
         dns_client.clone(),
+        #[cfg(feature = "stat")]
+        stat_manager.clone(),
     ));
+
+    let dispatcher_weak = Arc::downgrade(&dispatcher);
+    let dns_client_cloned = dns_client.clone();
+    rt.block_on(async move {
+        dns_client_cloned
+            .write()
+            .await
+            .replace_dispatcher(dispatcher_weak);
+    });
+
     let nat_manager = Arc::new(NatManager::new(dispatcher.clone()));
     let inbound_manager =
         InboundManager::new(&config.inbounds, dispatcher, nat_manager).map_err(Error::Config)?;
@@ -435,6 +463,11 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
         runners.push(r);
     }
 
+    #[cfg(feature = "inbound-cat")]
+    if let Ok(r) = inbound_manager.get_cat_runner() {
+        runners.push(r);
+    }
+
     #[cfg(all(feature = "inbound-tun", any(target_os = "macos", target_os = "linux")))]
     sys::post_tun_creation_setup(&net_info);
 
@@ -449,32 +482,27 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
         router,
         dns_client,
         outbound_manager,
+        #[cfg(feature = "stat")]
+        stat_manager,
     );
 
     // Monitor config file changes.
     #[cfg(feature = "auto-reload")]
     {
         if let Err(e) = runtime_manager.new_watcher() {
-            log::warn!("start config file watcher failed: {}", e);
+            warn!("start config file watcher failed: {}", e);
         }
     }
 
     #[cfg(feature = "api")]
     {
-        use std::net::{IpAddr, SocketAddr};
-        let listen_addr = if !(&*option::API_LISTEN).is_empty() {
+        use std::net::SocketAddr;
+        let listen_addr = if !option::API_LISTEN.is_empty() {
             Some(
-                (&*option::API_LISTEN)
+                option::API_LISTEN
                     .parse::<SocketAddr>()
                     .map_err(|e| Error::Config(anyhow!("parse SocketAddr failed: {}", e)))?,
             )
-        } else if let Some(api) = config.api.as_ref() {
-            Some(SocketAddr::new(
-                api.address
-                    .parse::<IpAddr>()
-                    .map_err(|e| Error::Config(anyhow!("parse IpAddr failed: {}", e)))?,
-                api.port as u16,
-            ))
         } else {
             None
         };
@@ -493,10 +521,10 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
             if let Some(res_tx) = reload_rx.recv().await {
                 let res = rm.reload().await;
                 if let Err(e) = res_tx.send(res) {
-                    log::warn!("sending reload result failed: {}", e);
+                    warn!("sending reload result failed: {}", e);
                 }
             } else {
-                log::warn!("receiving none reload signal");
+                warn!("receiving none reload signal");
             }
         }
     }));
@@ -522,21 +550,23 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
         .map_err(|_| Error::RuntimeManager)?
         .insert(rt_id, runtime_manager);
 
-    log::trace!("added runtime {}", &rt_id);
+    trace!("added runtime {}", &rt_id);
 
     rt.block_on(futures::future::select_all(tasks));
 
     #[cfg(all(feature = "inbound-tun", any(target_os = "macos", target_os = "linux")))]
     sys::post_tun_completion_setup(&net_info);
 
-    rt.shutdown_background();
+    drop(inbound_manager);
 
     RUNTIME_MANAGER
         .lock()
         .map_err(|_| Error::RuntimeManager)?
         .remove(&rt_id);
 
-    log::trace!("removed runtime {}", &rt_id);
+    rt.shutdown_background();
+
+    trace!("removed runtime {}", &rt_id);
 
     Ok(())
 }
@@ -560,7 +590,7 @@ socks-port = 1080
 Direct = direct
 "#;
 
-        for i in 1..10 {
+        for _i in 1..3 {
             thread::spawn(move || {
                 let opts = StartOptions {
                     config: Config::Str(conf.to_string()),
@@ -568,12 +598,12 @@ Direct = direct
                     auto_reload: false,
                     runtime_opt: RuntimeOption::SingleThread,
                 };
-                start(0, opts);
+                start(0, opts).unwrap();
             });
-            thread::sleep(std::time::Duration::from_secs(5));
-            shutdown(0);
+            thread::sleep(std::time::Duration::from_secs(2));
+            assert!(shutdown(0));
             loop {
-                thread::sleep(std::time::Duration::from_secs(2));
+                thread::sleep(std::time::Duration::from_secs(1));
                 if !is_running(0) {
                     break;
                 }

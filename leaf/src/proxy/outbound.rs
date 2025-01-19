@@ -1,10 +1,6 @@
 use std::io;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-
-use crate::session::Session;
-
 use super::*;
 
 /// An outbound handler groups a TCP outbound handler and a UDP outbound
@@ -12,27 +8,39 @@ use super::*;
 pub struct Handler {
     tag: String,
     color: colored::Color,
-    tcp_handler: AnyTcpOutboundHandler,
-    udp_handler: AnyUdpOutboundHandler,
+    stream_handler: Option<AnyOutboundStreamHandler>,
+    datagram_handler: Option<AnyOutboundDatagramHandler>,
 }
 
 impl Handler {
     pub(self) fn new(
         tag: String,
         color: colored::Color,
-        tcp_handler: AnyTcpOutboundHandler,
-        udp_handler: AnyUdpOutboundHandler,
+        stream_handler: Option<AnyOutboundStreamHandler>,
+        datagram_handler: Option<AnyOutboundDatagramHandler>,
     ) -> Arc<Self> {
         Arc::new(Handler {
             tag,
             color,
-            tcp_handler,
-            udp_handler,
+            stream_handler,
+            datagram_handler,
         })
     }
 }
 
-impl OutboundHandler for Handler {}
+impl OutboundHandler for Handler {
+    fn stream(&self) -> io::Result<&AnyOutboundStreamHandler> {
+        self.stream_handler
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no tcp handler"))
+    }
+
+    fn datagram(&self) -> io::Result<&AnyOutboundDatagramHandler> {
+        self.datagram_handler
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no udp handler"))
+    }
+}
 
 impl Tag for Handler {
     fn tag(&self) -> &String {
@@ -41,55 +49,16 @@ impl Tag for Handler {
 }
 
 impl Color for Handler {
-    fn color(&self) -> colored::Color {
-        (&self.color).to_owned()
-    }
-}
-
-#[async_trait]
-impl TcpOutboundHandler for Handler {
-    type Stream = AnyStream;
-
-    fn connect_addr(&self) -> Option<OutboundConnect> {
-        self.tcp_handler.connect_addr()
-    }
-
-    async fn handle<'a>(
-        &'a self,
-        sess: &'a Session,
-        stream: Option<Self::Stream>,
-    ) -> io::Result<Self::Stream> {
-        self.tcp_handler.handle(sess, stream).await
-    }
-}
-
-#[async_trait]
-impl UdpOutboundHandler for Handler {
-    type UStream = AnyStream;
-    type Datagram = AnyOutboundDatagram;
-
-    fn connect_addr(&self) -> Option<OutboundConnect> {
-        self.udp_handler.connect_addr()
-    }
-
-    fn transport_type(&self) -> DatagramTransportType {
-        self.udp_handler.transport_type()
-    }
-
-    async fn handle<'a>(
-        &'a self,
-        sess: &'a Session,
-        transport: Option<OutboundTransport<Self::UStream, Self::Datagram>>,
-    ) -> io::Result<Self::Datagram> {
-        self.udp_handler.handle(sess, transport).await
+    fn color(&self) -> &colored::Color {
+        &self.color
     }
 }
 
 pub struct HandlerBuilder {
     tag: String,
     color: colored::Color,
-    tcp_handler: AnyTcpOutboundHandler,
-    udp_handler: AnyUdpOutboundHandler,
+    stream_handler: Option<AnyOutboundStreamHandler>,
+    datagram_handler: Option<AnyOutboundDatagramHandler>,
 }
 
 impl HandlerBuilder {
@@ -97,11 +66,8 @@ impl HandlerBuilder {
         Self {
             tag: "".to_string(),
             color: colored::Color::Magenta,
-            tcp_handler: Box::new(super::null::outbound::TcpHandler { connect: None }),
-            udp_handler: Box::new(super::null::outbound::UdpHandler {
-                connect: None,
-                transport_type: super::DatagramTransportType::Undefined,
-            }),
+            stream_handler: None,
+            datagram_handler: None,
         }
     }
 
@@ -115,18 +81,23 @@ impl HandlerBuilder {
         self
     }
 
-    pub fn tcp_handler(mut self, v: AnyTcpOutboundHandler) -> Self {
-        self.tcp_handler = v;
+    pub fn stream_handler(mut self, v: AnyOutboundStreamHandler) -> Self {
+        self.stream_handler.replace(v);
         self
     }
 
-    pub fn udp_handler(mut self, v: AnyUdpOutboundHandler) -> Self {
-        self.udp_handler = v;
+    pub fn datagram_handler(mut self, v: AnyOutboundDatagramHandler) -> Self {
+        self.datagram_handler.replace(v);
         self
     }
 
-    pub fn build(self) -> Arc<Handler> {
-        Handler::new(self.tag, self.color, self.tcp_handler, self.udp_handler)
+    pub fn build(self) -> AnyOutboundHandler {
+        Handler::new(
+            self.tag,
+            self.color,
+            self.stream_handler,
+            self.datagram_handler,
+        )
     }
 }
 

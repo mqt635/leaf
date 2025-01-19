@@ -18,6 +18,19 @@ where
     default
 }
 
+fn get_env_var_or_else<T, F>(key: &str, f: F) -> T
+where
+    T: FromStr,
+    F: FnOnce() -> T,
+{
+    if let Ok(v) = env::var(key) {
+        if let Ok(v) = v.parse::<T>() {
+            return v;
+        }
+    }
+    f()
+}
+
 #[cfg(target_os = "ios")]
 lazy_static! {
     /// Maximum number of proxy outbound TCP connections allowed at the same time.
@@ -54,9 +67,26 @@ lazy_static! {
     };
 }
 
+#[cfg(feature = "stat")]
 lazy_static! {
-    pub static ref USER_AGENT: String = {
-        get_env_var_or("USER_AGENT", "".to_string())
+    pub static ref ENABLE_STATS: bool = get_env_var_or("ENABLE_STATS", false);
+}
+
+lazy_static! {
+    pub static ref HTTP_USER_AGENT: String = {
+        get_env_var_or_else(
+            "HTTP_USER_AGENT",
+            || get_env_var_or("USER_AGENT", "".to_string()), // legacy support
+        )
+    };
+
+    // The purpose is not to propagate the header, but to extract the forwarded
+    // source IP. Expects only comma separated IP list and only the first IP is
+    // taken as the forwarded source. Having this value customizable would benefit
+    // in case you don't trust the X-Forwarded-For header but there is another header
+    // which you can trust, for example the CF-Connecting-IP provided by Cloudflare.
+    pub static ref HTTP_FORWARDED_HEADER: String = {
+        get_env_var_or("HTTP_FORWARDED_HEADER", "X-Forwarded-For".to_string())
     };
 
     pub static ref LOG_CONSOLE_OUT: bool = {
@@ -67,14 +97,45 @@ lazy_static! {
         get_env_var_or("LOG_NO_COLOR", false)
     };
 
+    /// Turn on TLS SNI sniffing, the sniffed SNI would override the original
+    /// destination address, by default the sniffing would perform only on
+    /// connections with destination port 443, set also TLS_DOMAIN_SNIFFING_ALL
+    /// to make the sniffing work on all connections.
+    pub static ref TLS_DOMAIN_SNIFFING: bool = {
+        get_env_var_or_else(
+            "TLS_DOMAIN_SNIFFING",
+            || get_env_var_or("DOMAIN_SNIFFING", false), // deprecated env var
+        )
+    };
+
+    /// Turn on TLS SNI sniffing for all TCP connections, this may slow down the
+    /// connections a little bit, depending on whether the sniff can make an early
+    /// return.
+    pub static ref TLS_DOMAIN_SNIFFING_ALL: bool = {
+        get_env_var_or("TLS_DOMAIN_SNIFFING_ALL", false)
+    };
+
+    /// Turn on HTTP host sniffing, by default only perform on connections with
+    /// destination port 80.
+    pub static ref HTTP_DOMAIN_SNIFFING: bool = {
+        get_env_var_or("HTTP_DOMAIN_SNIFFING", false)
+    };
+
+    /// Turn on HTTP host sniffing for all TCP connections, this may slow down the
+    /// connections a little bit, depending on whether the sniff can make an early
+    /// return.
+    pub static ref HTTP_DOMAIN_SNIFFING_ALL: bool = {
+        get_env_var_or("HTTP_DOMAIN_SNIFFING_ALL", false)
+    };
+
     /// Uplink timeout after downlink EOF.
     pub static ref TCP_UPLINK_TIMEOUT: u64 = {
-        get_env_var_or("TCP_UPLINK_TIMEOUT", 2)
+        get_env_var_or("TCP_UPLINK_TIMEOUT", 10)
     };
 
     /// Downlink timeout after uplink EOF.
     pub static ref TCP_DOWNLINK_TIMEOUT: u64 = {
-        get_env_var_or("TCP_DOWNLINK_TIMEOUT", 4)
+        get_env_var_or("TCP_DOWNLINK_TIMEOUT", 10)
     };
 
     /// Buffer size for uplink and downlink connections, in KB.
@@ -82,8 +143,59 @@ lazy_static! {
         get_env_var_or("LINK_BUFFER_SIZE", 2)
     };
 
+    pub static ref NETSTACK_OUTPUT_CHANNEL_SIZE: usize = {
+        get_env_var_or("NETSTACK_OUTPUT_CHANNEL_SIZE", 512)
+    };
+
+    pub static ref NETSTACK_UDP_UPLINK_CHANNEL_SIZE: usize = {
+        get_env_var_or("NETSTACK_UDP_UPLINK_CHANNEL_SIZE", 256)
+    };
+
+    pub static ref UDP_UPLINK_CHANNEL_SIZE: usize = {
+        get_env_var_or("UDP_UPLINK_CHANNEL_SIZE", 256)
+    };
+
+    pub static ref UDP_DOWNLINK_CHANNEL_SIZE: usize = {
+        get_env_var_or("UDP_DOWNLINK_CHANNEL_SIZE", 256)
+    };
+
+    pub static ref QUIC_ACCEPT_CHANNEL_SIZE: usize = {
+        get_env_var_or("QUIC_ACCEPT_CHANNEL_SIZE", 1024)
+    };
+
+    pub static ref AMUX_ACCEPT_CHANNEL_SIZE: usize = {
+        get_env_var_or("AMUX_ACCEPT_CHANNEL_SIZE", 1024)
+    };
+
+    pub static ref AMUX_STREAM_CHANNEL_SIZE: usize = {
+        get_env_var_or("AMUX_STREAM_CHANNEL_SIZE", 16)
+    };
+
+    pub static ref AMUX_FRAME_CHANNEL_SIZE: usize = {
+        get_env_var_or("AMUX_FRAME_CHANNEL_SIZE", 32)
+    };
+
+    /// Buffer size for UDP datagrams receiving/sending, in KB.
+    pub static ref DATAGRAM_BUFFER_SIZE: usize = {
+        get_env_var_or("DATAGRAM_BUFFER_SIZE", 2)
+    };
+
+    /// The timeout for an accepted inbound TCP connection to finish the proxy
+    /// protocol handshake.
+    pub static ref INBOUND_ACCEPT_TIMEOUT: u64 = {
+        get_env_var_or("INBOUND_ACCEPT_TIMEOUT", 60)
+    };
+
     pub static ref OUTBOUND_DIAL_TIMEOUT: u64 = {
         get_env_var_or("OUTBOUND_DIAL_TIMEOUT", 4)
+    };
+
+    pub static ref OUTBOUND_DIAL_ORDER: crate::proxy::DialOrder = {
+        match get_env_var_or("OUTBOUND_DIAL_ORDER", "ordered".to_string()).as_str() {
+            "random" => crate::proxy::DialOrder::Random,
+            "partial-random" => crate::proxy::DialOrder::PartialRandom,
+            _ => crate::proxy::DialOrder::Ordered,
+        }
     };
 
     /// Maximum outbound dial concurrency.
@@ -92,9 +204,11 @@ lazy_static! {
     };
 
     pub static ref ASSET_LOCATION: String = {
-        let mut file = std::env::current_exe().unwrap();
-        file.pop();
-        get_env_var_or("ASSET_LOCATION", file.to_str().unwrap().to_string())
+        get_env_var_or_else("ASSET_LOCATION", || {
+            let mut file = std::env::current_exe().unwrap();
+            file.pop();
+            file.to_str().unwrap().to_string()
+        })
     };
 
     pub static ref CACHE_LOCATION: String = {
@@ -114,12 +228,13 @@ lazy_static! {
     };
 
     pub static ref UNSPECIFIED_BIND_ADDR: SocketAddr = {
-        let default =  if *ENABLE_IPV6 {
-            "[::]:0".to_string().parse().unwrap()
-        } else {
-            "0.0.0.0:0".to_string().parse().unwrap()
-        };
-        get_env_var_or("UNSPECIFIED_BIND_ADDR", default)
+        get_env_var_or_else("UNSPECIFIED_BIND_ADDR", || {
+            if *ENABLE_IPV6 {
+                "[::]:0".to_string().parse().unwrap()
+            } else {
+                "0.0.0.0:0".to_string().parse().unwrap()
+            }
+        })
     };
 
     pub static ref OUTBOUND_BINDS: Vec<crate::proxy::OutboundBind> = {

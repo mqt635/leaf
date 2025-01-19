@@ -1,0 +1,23 @@
+[package]
+name = "leaf-cli"
+version = "0.11.0"
+authors = ["eycorsican <eric.y.corsican@gmail.com>"]
+edition = "2021"
+
+[[bin]]
+name = "leaf"
+path = "src/main.rs"
+
+[features]
+default = [
+  "leaf/default-ring",
+  "leaf/outbound-quic",
+  "leaf/outbound-quic",
+  "leaf/ctrlc",
+  "leaf/auto-reload",
+]
+
+[dependencies]
+leaf = { path = "../leaf", default-features = false, optional = true }
+tokio = { version = "1", features = ["rt"] }
+argh = "0.1"

@@ -3,35 +3,56 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::future::{abortable, BoxFuture};
-use log::*;
 use tokio::sync::{
     mpsc::{self, Sender},
-    oneshot, Mutex as TokioMutex,
+    oneshot, Mutex, MutexGuard,
 };
+use tracing::{debug, error, trace};
 
 use crate::app::dispatcher::Dispatcher;
 use crate::option;
-use crate::session::{DatagramSource, Session, SocksAddr};
+use crate::session::{DatagramSource, Network, Session, SocksAddr};
 
 #[derive(Debug)]
 pub struct UdpPacket {
     pub data: Vec<u8>,
-    pub src_addr: Option<SocksAddr>,
-    pub dst_addr: Option<SocksAddr>,
+    pub src_addr: SocksAddr,
+    pub dst_addr: SocksAddr,
 }
 
-type SessionMap =
-    Arc<TokioMutex<HashMap<DatagramSource, (Sender<UdpPacket>, oneshot::Sender<bool>, Instant)>>>;
+impl UdpPacket {
+    pub fn new(data: Vec<u8>, src_addr: SocksAddr, dst_addr: SocksAddr) -> Self {
+        Self {
+            data,
+            src_addr,
+            dst_addr,
+        }
+    }
+}
+
+impl std::fmt::Display for UdpPacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{} <-> {}, {} bytes",
+            self.src_addr,
+            self.dst_addr,
+            self.data.len()
+        )
+    }
+}
+
+type SessionMap = HashMap<DatagramSource, (Sender<UdpPacket>, oneshot::Sender<bool>, Instant)>;
 
 pub struct NatManager {
-    sessions: SessionMap,
+    sessions: Arc<Mutex<SessionMap>>,
     dispatcher: Arc<Dispatcher>,
-    timeout_check_task: TokioMutex<Option<BoxFuture<'static, ()>>>,
+    timeout_check_task: Mutex<Option<BoxFuture<'static, ()>>>,
 }
 
 impl NatManager {
     pub fn new(dispatcher: Arc<Dispatcher>) -> Self {
-        let sessions: SessionMap = Arc::new(TokioMutex::new(HashMap::new()));
+        let sessions: Arc<Mutex<SessionMap>> = Arc::new(Mutex::new(HashMap::new()));
         let sessions2 = sessions.clone();
 
         // The task is lazy, will not run until any sessions added.
@@ -62,10 +83,9 @@ impl NatManager {
                 let n_removed = n_total - n_remaining;
                 drop(sessions); // release the lock
                 if n_removed > 0 {
-                    trace!(
+                    debug!(
                         "removed {} nat sessions, remaining {} sessions",
-                        n_removed,
-                        n_remaining
+                        n_removed, n_remaining
                     );
                 }
                 tokio::time::sleep(Duration::from_secs(
@@ -78,19 +98,14 @@ impl NatManager {
         NatManager {
             sessions,
             dispatcher,
-            timeout_check_task: TokioMutex::new(Some(timeout_check_task)),
+            timeout_check_task: Mutex::new(Some(timeout_check_task)),
         }
     }
 
-    pub async fn contains_key(&self, key: &DatagramSource) -> bool {
-        self.sessions.lock().await.contains_key(key)
-    }
-
-    pub async fn send(&self, key: &DatagramSource, pkt: UdpPacket) {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(sess) = sessions.get_mut(key) {
+    fn _send(&self, guard: &mut MutexGuard<'_, SessionMap>, key: &DatagramSource, pkt: UdpPacket) {
+        if let Some(sess) = guard.get_mut(key) {
             if let Err(err) = sess.0.try_send(pkt) {
-                debug!("send uplink packet failed {}", err);
+                trace!("send uplink packet failed {}", err);
             }
             sess.2 = Instant::now(); // activity update
         } else {
@@ -98,41 +113,77 @@ impl NatManager {
         }
     }
 
-    pub async fn size(&self) -> usize {
-        self.sessions.lock().await.len()
+    pub async fn send<'a>(
+        &self,
+        sess: Option<&Session>,
+        dgram_src: &DatagramSource,
+        inbound_tag: &str,
+        client_ch_tx: &Sender<UdpPacket>,
+        pkt: UdpPacket,
+    ) {
+        let mut guard = self.sessions.lock().await;
+
+        if guard.contains_key(dgram_src) {
+            self._send(&mut guard, dgram_src, pkt);
+            return;
+        }
+
+        let mut sess = sess.cloned().unwrap_or(Session {
+            network: Network::Udp,
+            source: dgram_src.address,
+            destination: pkt.dst_addr.clone(),
+            inbound_tag: inbound_tag.to_string(),
+            ..Default::default()
+        });
+        if sess.inbound_tag.is_empty() {
+            sess.inbound_tag = inbound_tag.to_string();
+        }
+
+        self.add_session(sess, *dgram_src, client_ch_tx.clone(), &mut guard)
+            .await;
+
+        debug!(
+            "added udp session {} -> {} ({})",
+            &dgram_src,
+            &pkt.dst_addr,
+            guard.len(),
+        );
+
+        self._send(&mut guard, dgram_src, pkt);
+
+        drop(guard);
     }
 
-    pub async fn add_session(
+    pub async fn add_session<'a>(
         &self,
-        sess: &Session,
+        sess: Session,
         raddr: DatagramSource,
         client_ch_tx: Sender<UdpPacket>,
+        guard: &mut MutexGuard<'a, SessionMap>,
     ) {
         // Runs the lazy task for session cleanup job, this task will run only once.
         if let Some(task) = self.timeout_check_task.lock().await.take() {
             tokio::spawn(task);
         }
 
-        let (target_ch_tx, mut target_ch_rx) = mpsc::channel(64);
+        let (target_ch_tx, mut target_ch_rx) =
+            mpsc::channel(*crate::option::UDP_UPLINK_CHANNEL_SIZE);
         let (downlink_abort_tx, downlink_abort_rx) = oneshot::channel();
 
-        self.sessions
-            .lock()
-            .await
-            .insert(raddr, (target_ch_tx, downlink_abort_tx, Instant::now()));
+        guard.insert(raddr, (target_ch_tx, downlink_abort_tx, Instant::now()));
 
         let dispatcher = self.dispatcher.clone();
         let sessions = self.sessions.clone();
-        let sess = sess.clone();
 
         // Spawns a new task for dispatching to avoid blocking the current task,
         // because we have stream type transports for UDP traffic, establishing a
         // TCP stream would block the task.
         tokio::spawn(async move {
             // new socket to communicate with the target.
-            let socket = match dispatcher.dispatch_udp(&sess).await {
+            let socket = match dispatcher.dispatch_datagram(sess).await {
                 Ok(s) => s,
-                Err(_) => {
+                Err(e) => {
+                    debug!("dispatch {} failed: {}", &raddr, e);
                     sessions.lock().await.remove(&raddr);
                     return;
                 }
@@ -140,35 +191,30 @@ impl NatManager {
 
             let (mut target_sock_recv, mut target_sock_send) = socket.split();
 
-            let client_ch_tx = client_ch_tx.clone();
-
             // downlink
             let downlink_task = async move {
-                let mut buf = [0u8; 2 * 1024];
+                let mut buf = vec![0u8; *crate::option::DATAGRAM_BUFFER_SIZE * 1024];
                 loop {
                     match target_sock_recv.recv_from(&mut buf).await {
                         Err(err) => {
-                            debug!("udp downlink error: {}", err);
-                            sessions.lock().await.remove(&raddr);
-                            break;
-                        }
-                        Ok((0, _)) => {
-                            debug!("receive zero-len udp packet");
-                            sessions.lock().await.remove(&raddr);
+                            debug!(
+                                "Failed to receive downlink packets on session {}: {}",
+                                &raddr, err
+                            );
                             break;
                         }
                         Ok((n, addr)) => {
-                            let pkt = UdpPacket {
-                                data: (&buf[..n]).to_vec(),
-                                src_addr: Some(addr.clone()),
-                                dst_addr: Some(SocksAddr::from(raddr.address)),
-                            };
+                            trace!("outbound received UDP packet: src {}, {} bytes", &addr, n);
+                            let pkt = UdpPacket::new(
+                                buf[..n].to_vec(),
+                                addr.clone(),
+                                SocksAddr::from(raddr.address),
+                            );
                             if let Err(err) = client_ch_tx.send(pkt).await {
                                 debug!(
-                                    "send downlink packet failed {} -> {}: {}",
-                                    &addr, &raddr, err
+                                    "Failed to send downlink packets on session {} to {}: {}",
+                                    &raddr, &addr, err
                                 );
-                                sessions.lock().await.remove(&raddr);
                                 break;
                             }
 
@@ -191,6 +237,7 @@ impl NatManager {
                         }
                     }
                 }
+                sessions.lock().await.remove(&raddr);
             };
 
             let (downlink_task, downlink_task_handle) = abortable(downlink_task);
@@ -198,40 +245,28 @@ impl NatManager {
 
             // Runs a task to receive the abort signal.
             tokio::spawn(async move {
-                if let Err(e) = downlink_abort_rx.await {
-                    debug!(
-                        "failed to receive abort signal on session {}: {}",
-                        &raddr, e
-                    );
-                };
+                let _ = downlink_abort_rx.await;
                 downlink_task_handle.abort();
             });
 
             // uplink
             tokio::spawn(async move {
                 while let Some(pkt) = target_ch_rx.recv().await {
-                    if pkt.dst_addr.is_none() {
-                        warn!("unexpected none dst addr in uplink pkts");
-                        continue;
+                    trace!(
+                        "outbound send UDP packet: dst {}, {} bytes",
+                        &pkt.dst_addr,
+                        pkt.data.len()
+                    );
+                    if let Err(e) = target_sock_send.send_to(&pkt.data, &pkt.dst_addr).await {
+                        debug!(
+                            "Failed to send uplink packets on session {} to {}: {:?}",
+                            &raddr, &pkt.dst_addr, e
+                        );
+                        break;
                     }
-                    let addr = match pkt.dst_addr {
-                        Some(a) => a,
-                        None => {
-                            warn!("unexpected none addr");
-                            continue;
-                        }
-                    };
-                    match target_sock_send.send_to(&pkt.data, &addr).await {
-                        Ok(0) => {
-                            debug!("uplink send zero bytes");
-                        }
-                        Ok(_) => {
-                            continue;
-                        }
-                        Err(err) => {
-                            debug!("uplink send error {:?}", err);
-                        }
-                    }
+                }
+                if let Err(e) = target_sock_send.close().await {
+                    debug!("Failed to close outbound datagram {}: {}", &raddr, e);
                 }
             });
         });

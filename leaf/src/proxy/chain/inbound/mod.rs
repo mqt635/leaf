@@ -6,14 +6,15 @@ use futures::{
     ready,
     task::{Context, Poll},
 };
+use tracing::{debug, warn};
 
 use crate::proxy::*;
 
-mod tcp;
-mod udp;
+mod datagram;
+mod stream;
 
-pub use tcp::Handler as TcpHandler;
-pub use udp::Handler as UdpHandler;
+pub use datagram::Handler as DatagramHandler;
+pub use stream::Handler as StreamHandler;
 
 enum State {
     WaitingIncoming,
@@ -53,13 +54,12 @@ impl Stream for Incoming {
                             let sess = sess.clone();
                             let a = self.actors[0].clone();
                             // Create the task for handling the first actor.
-                            let t = Box::pin(async move {
-                                TcpInboundHandler::handle(a.as_ref(), sess, stream).await
-                            });
+                            let t = Box::pin(async move { a.stream()?.handle(sess, stream).await });
                             self.state = State::Pending(0, t);
                         }
                         Some(_) => {
-                            return Poll::Ready(None);
+                            warn!("unexpected non-stream chain inbound incoming transport");
+                            continue;
                         }
                         None => {
                             return Poll::Ready(None);
@@ -81,18 +81,26 @@ impl Stream for Incoming {
                             // Otherwise proceed with a new task for the next actor.
                             let new_sess = new_sess.clone();
                             let a = self.actors[idx + 1].clone();
-                            let t = Box::pin(async move {
-                                TcpInboundHandler::handle(a.as_ref(), new_sess, new_stream).await
-                            });
+                            let t =
+                                Box::pin(
+                                    async move { a.stream()?.handle(new_sess, new_stream).await },
+                                );
                             self.state = State::Pending(idx + 1, t);
                         }
-                        Ok(InboundTransport::Datagram(socket)) => {
+                        Ok(InboundTransport::Datagram(socket, sess)) => {
                             // FIXME Assume the last one, but not necessary the last one?
                             self.state = State::WaitingIncoming;
-                            return Poll::Ready(Some(AnyBaseInboundTransport::Datagram(socket)));
+                            return Poll::Ready(Some(AnyBaseInboundTransport::Datagram(
+                                socket, sess,
+                            )));
+                        }
+                        Err(e) => {
+                            debug!("chain inbound incoming error: {}", e);
+                            self.state = State::WaitingIncoming;
+                            continue;
                         }
                         _ => {
-                            log::warn!("unexpected non-stream transport");
+                            warn!("unexpected chain inbound incoming transport");
                             self.state = State::WaitingIncoming;
                             return Poll::Ready(None);
                         }

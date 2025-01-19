@@ -38,7 +38,7 @@ socks-port = 1080
 Direct = direct
 ```
 
-More configuration examples can be found [here](https://github.com/eycorsican/leaf/blob/master/README.zh.md).
+More configuration examples can be found [here](https://github.com/eycorsican/leaf/blob/master/README.zh.md). If you want more flexible control on the config options, the JSON format should be used, up-to-date examples for the JSON format could be found in the [tests](https://github.com/eycorsican/leaf/blob/master/leaf/tests), both client-side and server-side config examples are presented there.
 
 ## TUN Mode and Gateway Mode
 
@@ -69,7 +69,7 @@ GATEWAY_MODE=true leaf -c config.conf
 
 ## iOS & Android
 
-<a href="https://play.google.com/store/apps/details?id=com.leaf.example.aleaf"><img src="https://upload.wikimedia.org/wikipedia/commons/7/78/Google_Play_Store_badge_EN.svg" height="70"></a>
+<a href="https://play.google.com/store/apps/details?id=com.leaf.and.aleaf"><img src="https://upload.wikimedia.org/wikipedia/commons/7/78/Google_Play_Store_badge_EN.svg" height="70"></a>
 
 <a href="https://apps.apple.com/us/app/leaf-lightweight-proxy/id1534109007"><img src="https://upload.wikimedia.org/wikipedia/commons/3/3c/Download_on_the_App_Store_Badge.svg" height="70"></a>
 
@@ -83,7 +83,7 @@ Clone & Build:
 ```sh
 git clone --recursive https://github.com/eycorsican/leaf.git
 cd leaf
-cargo build -p leaf-bin
+cargo build -p leaf-cli
 ```
 
 Run:
